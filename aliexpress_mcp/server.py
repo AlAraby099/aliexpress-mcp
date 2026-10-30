@@ -1,16 +1,5 @@
-"""MCP server exposing AliExpress product search — self-hosted, no API key.
 
-There is no official AliExpress product API, so this mirrors the aliexpress.com
-web frontend: server-rendered search pages for ``search_aliexpress``, and for
-``get_aliexpress_product`` the site's internal MTop API (token bootstrap + MD5
-request signing) with a composite product-page/search fallback for when MTop is
-anti-bot gated — which it is at the time of writing. See ``aliexpress_client``
-for the gory details and the fragility caveats.
-
-Ported from Averyy/fetchaller-mcp (MIT). Transport, packaging and ``/healthz``
-mirror the sibling ebay-mcp so it runs as a long-lived container behind
-LibreChat instead of stdio. Market defaults to Germany / EUR / de_DE.
-"""
+"""MCP server exposing AliExpress and Alibaba product search."""
 
 from __future__ import annotations
 
@@ -33,83 +22,86 @@ from aliexpress_mcp.aliexpress_client import (
     search,
 )
 
+from aliexpress_mcp.alibaba_client import (
+    search_alibaba as alibaba_search,
+    get_alibaba_product as alibaba_get_product,
+)
+
 log = logging.getLogger("aliexpress-mcp")
 
 
 def _coerce_int(
     value: str | int | None, field: str, *, ge: int | None = None
 ) -> int | None:
-    """Coerce the numeric strings LLMs routinely send for int parameters.
-
-    FastMCP validates tool input against the JSON schema before the function
-    runs, so a parameter typed ``int`` rejects the string ``"600"`` outright
-    (the same bug kleinanzeigen-mcp 0.1.1 and geizhals-mcp 0.1.3 fixed).
-    Accepting ``str | int`` in the schema and normalising here keeps the
-    model-facing contract lenient while the client still sees a real int.
-    """
     if value is None or isinstance(value, int):
         result = value
     elif isinstance(value, str) and value.strip():
         try:
             result = int(value.strip())
         except ValueError as exc:
-            raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+            raise ValueError(
+                f"{field} must be an integer, got {value!r}"
+            ) from exc
     else:
         raise ValueError(f"{field} must be an integer, got {value!r}")
+
     if ge is not None and result is not None and result < ge:
         raise ValueError(f"{field} must be >= {ge}, got {result}")
+
     return result
 
 
 def _coerce_float(
     value: str | float | None, field: str, *, ge: float | None = None
 ) -> float | None:
-    """Coerce numeric strings for float parameters (prices). See _coerce_int."""
     if value is None or isinstance(value, (int, float)):
         result = float(value) if value is not None else None
     elif isinstance(value, str) and value.strip():
         try:
             result = float(value.strip())
         except ValueError as exc:
-            raise ValueError(f"{field} must be a number, got {value!r}") from exc
+            raise ValueError(
+                f"{field} must be a number, got {value!r}"
+            ) from exc
     else:
         raise ValueError(f"{field} must be a number, got {value!r}")
+
     if ge is not None and result is not None and result < ge:
         raise ValueError(f"{field} must be >= {ge}, got {result}")
+
     return result
 
 
-def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> int:
-    """Accept either name for the result-cap knob on `search_aliexpress`.
-
-    Across the sibling MCP servers this knob has two names — `max_results` in
-    geizhals-mcp and baumarkt-mcp, `limit` here (and in ebay-mcp, amazon-mcp) —
-    and one LLM sees all of them in a single conversation. FastMCP emits
-    ``additionalProperties: false``, so a model that carries the wrong tool's
-    name over gets a hard schema rejection, and the MCP client's error names no
-    field, so the model cannot see what to fix and can only guess. `limit`
-    stays canonical here (renaming it would just churn every existing caller),
-    but `max_results` is accepted too, for the same reason kleinanzeigen-mcp's
-    `_resolve_page_count` accepts both `page_count` and `max_pages`.
-    """
+def _resolve_limit(
+    limit: str | int | None,
+    max_results: str | int | None,
+) -> int:
     if limit is not None and max_results is not None:
         resolved = _coerce_int(limit, "limit", ge=1)
         alias = _coerce_int(max_results, "max_results", ge=1)
+
         if resolved != alias:
             raise ValueError(
-                "limit and max_results are two names for the same parameter "
-                f"but were given different values ({resolved} and {alias}); "
-                "pass limit only"
+                "limit and max_results have different values"
             )
     elif max_results is not None:
         resolved = _coerce_int(max_results, "max_results", ge=1)
     else:
         resolved = _coerce_int(limit, "limit", ge=1)
+
     return min(resolved or 10, 60)
 
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
 auth_token = os.environ.get("MCP_AUTH_TOKEN")
+
 if not auth_token:
-    raise RuntimeError("MCP_AUTH_TOKEN environment variable is required")
+    raise RuntimeError(
+        "MCP_AUTH_TOKEN environment variable is required"
+    )
 
 auth = StaticTokenVerifier(
     tokens={
@@ -120,92 +112,78 @@ auth = StaticTokenVerifier(
         }
     }
 )
+
 mcp = FastMCP(
     name="aliexpress",
-    version="0.3.3",  # x-release-please-version
+    version="0.4.0",
     auth=auth,
     instructions=(
-        "Search AliExpress and inspect product listings. This is key-less and "
-        f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
-        f"are localised to {LOCALE}. Start with `search_aliexpress` to get a list "
-        "of products with their ids and prices, then call "
-        "`get_aliexpress_product` with a product id (or its full URL) for a closer "
-        "look. That tool's answer may be complete or partial depending on what "
-        "AliExpress is currently serving — check its `partial` flag and its "
-        "`unavailable` list, and report a field named there as 'could not be "
-        "retrieved' rather than as absent from the listing. "
-        "This is read-only — it searches and reads listings, it cannot buy. "
-        "AliExpress has no public API; results come from its web frontend and can "
-        "occasionally be blocked by anti-bot protection."
+        "This MCP server provides read-only product search and product "
+        "details from AliExpress and Alibaba.com. "
+        "Use search_aliexpress and get_aliexpress_product for AliExpress. "
+        "Use search_alibaba and get_alibaba_product for Alibaba.com. "
+        "Alibaba is a B2B marketplace and product prices, minimum order "
+        "quantities and supplier details may vary. "
+        "The tools cannot purchase products, send RFQs or contact suppliers. "
+        "Both websites may block automated requests or change their page "
+        "structures, so some requests may fail."
     ),
 )
 
 
-# --------------------------------------------------------------------------- #
-# tools
-# --------------------------------------------------------------------------- #
-
+# ---------------------------------------------------------------------------
+# AliExpress tools
+# ---------------------------------------------------------------------------
 
 @mcp.tool
 def search_aliexpress(
     query: Annotated[
         str,
-        Field(description="Search keywords, e.g. 'usb c kabel' or 'anker powerbank'"),
+        Field(description="AliExpress search keywords"),
     ],
     limit: Annotated[
         str | int | None,
-        Field(description="Maximum results to return (one page holds ~60)"),
+        Field(description="Maximum results to return"),
     ] = None,
     sort: Annotated[
         Optional[str],
         Field(
             description=(
-                "Sort order: 'orders' (best-selling), 'price_asc' (cheapest first), "
-                "'price_desc' (most expensive first), 'newest'. Omit for AliExpress's "
-                "default relevance ranking."
-            )
+                "Sort order: orders, price_asc, price_desc, newest"
+            ),
         ),
     ] = None,
     min_price: Annotated[
         str | float | None,
-        Field(description=f"Minimum price filter, in {CURRENCY}."),
+        Field(description=f"Minimum price in {CURRENCY}"),
     ] = None,
     max_price: Annotated[
         str | float | None,
-        Field(description=f"Maximum price filter, in {CURRENCY}."),
+        Field(description=f"Maximum price in {CURRENCY}"),
     ] = None,
     page: Annotated[
-        str | int, Field(description="Result page (1-indexed), ~60 items per page.")
+        str | int,
+        Field(description="Result page, starting from 1"),
     ] = 1,
     max_results: Annotated[
         str | int | None,
-        Field(description="Deprecated alias for `limit`; prefer `limit`."),
+        Field(description="Alternative name for limit"),
     ] = None,
 ) -> dict[str, Any]:
-    """Search AliExpress product listings by keyword.
+    """Search AliExpress product listings."""
 
-    Returns a list of products — id, title, sale price (and original price /
-    discount), star rating, orders-sold text, thumbnail image and product URL.
-    Prices and titles follow the configured market (Germany / EUR by default).
-    Pass a product's `id` to `get_aliexpress_product` for full details.
+    resolved_limit = _resolve_limit(limit, max_results)
+    resolved_page = _coerce_int(page, "page", ge=1) or 1
+    resolved_min = _coerce_float(min_price, "min_price", ge=0)
+    resolved_max = _coerce_float(max_price, "max_price", ge=0)
 
-    Failures (anti-bot blocks, a parser breaking against a changed page) are
-    raised as tool errors, not returned as an empty result — an empty result
-    can only mean "no hits".
-    """
-    limit = _resolve_limit(limit, max_results)
-    page = _coerce_int(page, "page", ge=1) or 1
-    min_price = _coerce_float(min_price, "min_price", ge=0)
-    max_price = _coerce_float(max_price, "max_price", ge=0)
-    # Deliberately no error swallowing: a block or a broken parser must reach
-    # the MCP client as an error, not masquerade as a genuinely empty search.
     return search(
         query=query,
-        limit=limit,
+        limit=resolved_limit,
         sort=sort,
-        min_price=min_price,
-        max_price=max_price,
-        page=page,
+        min_price=resolved_min,
+        max_price=resolved_max,
+        page=resolved_page,
     )
 
 
@@ -215,61 +193,76 @@ def get_aliexpress_product(
         str,
         Field(
             description=(
-                "AliExpress product id (a numeric string such as '1005009258005772') "
-                "or a full product URL like "
-                "'https://www.aliexpress.com/item/1005009258005772.html'."
-            )
+                "AliExpress product ID or full product URL"
+            ),
         ),
     ],
 ) -> dict[str, Any]:
-    """Retrieve the record of one AliExpress product.
+    """Retrieve details for an AliExpress product."""
 
-    Use after `search_aliexpress` surfaces something worth a closer look.
-
-    How complete the answer is depends on which source could serve it, so check
-    the `source` and `partial` fields before describing it to the user:
-
-    * `source: "mtop"`, `partial: false` — the full record: title, selected-variant
-      price plus per-variant pricing, star rating and review count, orders sold,
-      stock, the store (name, positive rating, country), shipping (origin,
-      ship-to, delivery estimate), the SKU option axes (e.g. colour / size),
-      specifications and all product images.
-    * `source: "ssr+search"`, `partial: true` — AliExpress is currently gating its
-      detail API behind an anti-bot challenge, so the record is composed from the
-      product page and search results: title, images, url, price, rating and
-      orders. Every field that could not be obtained is named in `unavailable`.
-      Occasionally even price/rating cannot be recovered; `price_note` explains
-      why and `search_status` distinguishes the two causes — `blocked` (AliExpress
-      is rate-limiting right now, so it is worth retrying later) from `not_found`
-      (the listing genuinely did not turn up in search). Say which one it was
-      rather than just "no price available".
-
-    Prices are in the configured currency (EUR by default). A field listed in
-    `unavailable` is unknown, **not** absent from the listing — do not tell the
-    user a product has no variants, no reviews or no shipping options on that
-    basis; say that detail could not be retrieved.
-
-    Total failures (unknown id format, delisted listing, blocked transports)
-    are raised as tool errors — there is no success-shaped dict carrying an
-    `error` field that could be mistaken for a retrieved record.
-    """
-    # Deliberately no error swallowing: see search_aliexpress.
     return get_product(product)
 
 
-# --------------------------------------------------------------------------- #
-# transport
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Alibaba tools
+# ---------------------------------------------------------------------------
 
+@mcp.tool
+def search_alibaba(
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "Alibaba.com B2B product search keywords, "
+                "for example: coffee machine, packaging machine"
+            ),
+        ),
+    ],
+    page: Annotated[
+        str | int,
+        Field(description="Result page, starting from 1"),
+    ] = 1,
+    limit: Annotated[
+        str | int,
+        Field(description="Maximum number of results, up to 30"),
+    ] = 10,
+) -> dict[str, Any]:
+    """Search Alibaba.com B2B product listings."""
+
+    resolved_page = _coerce_int(page, "page", ge=1) or 1
+    resolved_limit = _coerce_int(limit, "limit", ge=1) or 10
+
+    return alibaba_search(
+        query=query,
+        page=resolved_page,
+        limit=min(resolved_limit, 30),
+    )
+
+
+@mcp.tool
+def get_alibaba_product(
+    product: Annotated[
+        str,
+        Field(
+            description=(
+                "Alibaba product ID or full product URL"
+            ),
+        ),
+    ],
+) -> dict[str, Any]:
+    """Retrieve available details for an Alibaba.com product."""
+
+    return alibaba_get_product(product)
+
+
+# ---------------------------------------------------------------------------
+# Health check and transport
+# ---------------------------------------------------------------------------
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(_: Request) -> JSONResponse:
-    """Container readiness probe.
+    """Container readiness probe."""
 
-    There is no credential or hard dependency to check, so this is always 200 as
-    long as the process is up — a blocked AliExpress upstream is a per-request
-    condition surfaced in the tool response, not container ill-health.
-    """
     return JSONResponse(liveness())
 
 
@@ -278,15 +271,23 @@ def main() -> None:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    log.info("aliexpress-mcp starting (market=%s currency=%s locale=%s)", REGION, CURRENCY, LOCALE)
+
+    log.info(
+        "AliExpress and Alibaba MCP server starting "
+        "(market=%s currency=%s locale=%s)",
+        REGION,
+        CURRENCY,
+        LOCALE,
+    )
 
     transport = os.getenv("MCP_TRANSPORT", "http")
+
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:
         mcp.run(
             transport="http",
-            host=os.getenv("MCP_HOST", "0.0.0.0"),  # noqa: S104 - containerised
+            host=os.getenv("MCP_HOST", "0.0.0.0"),
             port=int(os.getenv("MCP_PORT", "8000")),
             path=os.getenv("MCP_PATH", "/mcp"),
         )
@@ -294,3 +295,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+        
