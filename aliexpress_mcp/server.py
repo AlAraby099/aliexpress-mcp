@@ -114,6 +114,7 @@ if not auth_token:
 auth = StaticTokenVerifier(
     tokens={
         auth_token: {
+            "sub": "admin",
             "client_id": "aliexpress-client",
             "scopes": [],
         }
