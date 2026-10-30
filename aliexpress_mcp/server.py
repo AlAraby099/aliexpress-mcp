@@ -19,6 +19,7 @@ import os
 from typing import Annotated, Any, Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import StaticTokenVerifier
 from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -106,10 +107,22 @@ def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> in
         resolved = _coerce_int(limit, "limit", ge=1)
     return min(resolved or 10, 60)
 
+auth_token = os.environ.get("MCP_AUTH_TOKEN")
+if not auth_token:
+    raise RuntimeError("MCP_AUTH_TOKEN environment variable is required")
 
+auth = StaticTokenVerifier(
+    tokens={
+        auth_token: {
+            "client_id": "aliexpress-client",
+            "scopes": [],
+        }
+    }
+)
 mcp = FastMCP(
     name="aliexpress",
     version="0.3.3",  # x-release-please-version
+    auth=auth,
     instructions=(
         "Search AliExpress and inspect product listings. This is key-less and "
         f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
