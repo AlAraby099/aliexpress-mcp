@@ -1,4 +1,3 @@
-
 """MCP server exposing AliExpress and Alibaba product search."""
 
 from __future__ import annotations
